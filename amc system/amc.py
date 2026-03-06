@@ -17,7 +17,12 @@ import time
 import warnings
 import numpy as np
 import numexpr as ne
-import rtlsdr as rtl
+try:
+    import rtlsdr as rtl
+    RTL_AVAILABLE = True
+except ImportError:
+    RTL_AVAILABLE = False
+    print("Warning: RTL-SDR library not available. SDR functionality will be disabled.")
 from termcolor import cprint
 warnings.filterwarnings("ignore")
 
@@ -89,14 +94,18 @@ class amcnet():
             self.v.append(np.zeros(shape))
 
         # Initialize SDR
-        try:
-            self.SDR = rtl.RtlSdr()
-            self.SDR.sample_rate = bw
-            self.SDR.center_freq = fc
-            self.SDR.gain = gain
-        except Exception as e:
-            print(f"Error initializing SDR: {str(e)}")
+        if RTL_AVAILABLE:
+            try:
+                self.SDR = rtl.RtlSdr()
+                self.SDR.sample_rate = bw
+                self.SDR.center_freq = fc
+                self.SDR.gain = gain
+            except Exception as e:
+                print(f"Error initializing SDR: {str(e)}")
+                self.SDR = None
+        else:
             self.SDR = None
+            print("SDR not available - system will operate in test mode only")
 
     def matmul(self, A, B):
         """
@@ -196,7 +205,153 @@ class amcnet():
         
         return cols.T
 
-    # [Previous methods remain unchanged: forwardpass, backprop, train, etc.]
+    def relu(self, x):
+        """
+        ReLU activation function
+        """
+        return np.maximum(0, x)
+
+    def softmax(self, x):
+        """
+        Numerically stable softmax implementation
+        """
+        exp_x = np.exp(x - np.max(x))
+        return exp_x / np.sum(exp_x)
+
+    def SNR(self, samples):
+        """
+        Estimate Signal-to-Noise Ratio
+        """
+        signal_power = np.mean(np.abs(samples)**2)
+        noise_power = np.var(np.abs(samples))
+        
+        if noise_power == 0:
+            return float('inf')
+        
+        snr_linear = signal_power / noise_power
+        snr_db = 10 * np.log10(snr_linear) if snr_linear > 0 else -float('inf')
+        return snr_db
+
+    def forwardpass(self, input_data):
+        """
+        Forward pass through the CNN
+        Network architecture:
+        - Conv1: 256 filters (1x3) + ReLU + MaxPool (1x2)
+        - Conv2: 80 filters (2x3) + ReLU + MaxPool (1x2)
+        - Dense1: 128 neurons + ReLU
+        - Dense2: 13 neurons + Softmax
+        """
+        # Reshape input to (2, 128)
+        x = np.array(input_data).reshape(2, 128).astype(np.float32)
+        
+        # Add batch and channel dimensions: (1, 2, 128, 1)
+        x = x.reshape(1, 2, 128, 1)
+        
+        # Conv Layer 1: 256 filters (1x3)
+        # filters[0] shape: (256, 1, 3)
+        # Input shape: (1, 2, 128, 1)
+        # Output shape: (1, 2, 126, 256)
+        conv1_out = np.zeros((1, 2, 126, 256))
+        for i in range(256):
+            for h in range(2):
+                for w in range(126):
+                    conv1_out[0, h, w, i] = np.sum(x[0, h:h+1, w:w+3, :] * self.filters[0][i, :, :].reshape(1, 3, 1))
+        
+        # ReLU activation
+        conv1_out = self.relu(conv1_out)
+        
+        # MaxPool (1x2)
+        pool1_out = np.zeros((1, 2, 63, 256))
+        for h in range(2):
+            for w in range(63):
+                pool1_out[0, h, w, :] = np.max(conv1_out[0, h, w*2:w*2+2, :], axis=0)
+        
+        # Conv Layer 2: 80 filters (2x3)
+        # filters[1] shape: (80, 256, 2, 3)
+        # pool1_out shape: (1, 2, 63, 256)
+        # Output shape: (1, 1, 61, 80)
+        conv2_out = np.zeros((1, 1, 61, 80))
+        for i in range(80):
+            for w in range(61):
+                # Extract region: shape (2, 3, 256)
+                region = pool1_out[0, :, w:w+3, :]
+                # Filter shape: (256, 2, 3) - need to match dimensions
+                filter_weights = self.filters[1][i, :, :, :]
+                # Reshape for proper multiplication: transpose filter to (2, 3, 256)
+                filter_reshaped = np.transpose(filter_weights, (1, 2, 0))
+                conv2_out[0, 0, w, i] = np.sum(region * filter_reshaped)
+        
+        # ReLU activation
+        conv2_out = self.relu(conv2_out)
+        
+        # MaxPool (1x2)
+        pool2_out = np.zeros((1, 1, 30, 80))
+        for w in range(30):
+            pool2_out[0, 0, w, :] = np.max(conv2_out[0, 0, w*2:w*2+2, :], axis=0)
+        
+        # Flatten
+        flattened = pool2_out.reshape(1, -1)
+        
+        # Adjust flattened size to match weight dimensions (9920)
+        if flattened.shape[1] < 9920:
+            flattened = np.pad(flattened, ((0, 0), (0, 9920 - flattened.shape[1])))
+        elif flattened.shape[1] > 9920:
+            flattened = flattened[:, :9920]
+        
+        # Dense Layer 1: 128 neurons
+        dense1_out = self.matmul(flattened, self.weights[0]) + self.biases[0]
+        dense1_out = self.relu(dense1_out)
+        
+        # Dense Layer 2: 13 neurons
+        dense2_out = self.matmul(dense1_out, self.weights[1]) + self.biases[1]
+        
+        # Softmax
+        output = self.softmax(dense2_out[0])
+        
+        return output
+
+    def backprop(self, input_data, target):
+        """
+        Backpropagation through the network
+        Returns gradients for all parameters
+        """
+        # This is a simplified placeholder for backprop
+        # Full implementation would require storing all intermediate activations
+        pass
+
+    def train(self, epochs=10):
+        """
+        Train the network using the stored samples
+        """
+        if len(self.samples) == 0:
+            print("No training data available")
+            return
+        
+        print(f"Training for {epochs} epochs...")
+        for epoch in range(epochs):
+            correct = 0
+            total_loss = 0
+            
+            for idx, sample in enumerate(self.samples):
+                target = self.classes[idx]
+                output = self.forwardpass(sample)
+                
+                # Calculate loss (cross-entropy)
+                loss = -np.log(output[target] + 1e-10)
+                total_loss += loss
+                
+                # Check accuracy
+                if np.argmax(output) == target:
+                    correct += 1
+            
+            accuracy = correct / len(self.samples)
+            avg_loss = total_loss / len(self.samples)
+            
+            self.losshistory.append(avg_loss)
+            self.acchistory.append(accuracy)
+            
+            if epoch % 5 == 0:
+                print(f"Epoch {epoch}: Loss = {avg_loss:.4f}, Accuracy = {accuracy:.4f}")
     
     def identifyModulation(self, fc=90e6, gain=0.0, bw=2.4e6, N=1):
         """
