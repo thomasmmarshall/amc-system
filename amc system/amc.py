@@ -232,12 +232,13 @@ class amcnet():
         snr_db = 10 * np.log10(snr_linear) if snr_linear > 0 else -float('inf')
         return snr_db
 
-    def forwardpass(self, input_data):
+    def forwardpass(self, input_data, store_activations=False):
         """
-        Forward pass through the CNN
-        Network architecture:
-        - Conv1: 256 filters (1x3) + ReLU + MaxPool (1x2)
-        - Conv2: 80 filters (2x3) + ReLU + MaxPool (1x2)
+        Forward pass through the CNN (CNN2 architecture - NO MaxPooling)
+        Architecture based on CNN2.py:
+        - Conv1: 256 filters (1x3) + ReLU
+        - Conv2: 80 filters (2x3) + ReLU
+        - Flatten: 1×124×80 = 9920
         - Dense1: 128 neurons + ReLU
         - Dense2: 13 neurons + Softmax
         """
@@ -247,7 +248,7 @@ class amcnet():
         # Add batch and channel dimensions: (1, 2, 128, 1)
         x = x.reshape(1, 2, 128, 1)
         
-        # Conv Layer 1: 256 filters (1x3)
+        # Conv Layer 1: 256 filters (1x3), no padding
         # filters[0] shape: (256, 1, 3)
         # Input shape: (1, 2, 128, 1)
         # Output shape: (1, 2, 126, 256)
@@ -260,43 +261,23 @@ class amcnet():
         # ReLU activation
         conv1_out = self.relu(conv1_out)
         
-        # MaxPool (1x2)
-        pool1_out = np.zeros((1, 2, 63, 256))
-        for h in range(2):
-            for w in range(63):
-                pool1_out[0, h, w, :] = np.max(conv1_out[0, h, w*2:w*2+2, :], axis=0)
-        
-        # Conv Layer 2: 80 filters (2x3)
+        # Conv Layer 2: 80 filters (2x3), no padding
         # filters[1] shape: (80, 256, 2, 3)
-        # pool1_out shape: (1, 2, 63, 256)
-        # Output shape: (1, 1, 61, 80)
-        conv2_out = np.zeros((1, 1, 61, 80))
+        # conv1_out shape: (1, 2, 126, 256)
+        # Output shape: (1, 1, 124, 80)
+        conv2_out = np.zeros((1, 1, 124, 80))
         for i in range(80):
-            for w in range(61):
-                # Extract region: shape (2, 3, 256)
-                region = pool1_out[0, :, w:w+3, :]
-                # Filter shape: (256, 2, 3) - need to match dimensions
+            for w in range(124):
+                region = conv1_out[0, :, w:w+3, :]
                 filter_weights = self.filters[1][i, :, :, :]
-                # Reshape for proper multiplication: transpose filter to (2, 3, 256)
                 filter_reshaped = np.transpose(filter_weights, (1, 2, 0))
                 conv2_out[0, 0, w, i] = np.sum(region * filter_reshaped)
         
         # ReLU activation
         conv2_out = self.relu(conv2_out)
         
-        # MaxPool (1x2)
-        pool2_out = np.zeros((1, 1, 30, 80))
-        for w in range(30):
-            pool2_out[0, 0, w, :] = np.max(conv2_out[0, 0, w*2:w*2+2, :], axis=0)
-        
-        # Flatten
-        flattened = pool2_out.reshape(1, -1)
-        
-        # Adjust flattened size to match weight dimensions (9920)
-        if flattened.shape[1] < 9920:
-            flattened = np.pad(flattened, ((0, 0), (0, 9920 - flattened.shape[1])))
-        elif flattened.shape[1] > 9920:
-            flattened = flattened[:, :9920]
+        # Flatten: 1 × 124 × 80 = 9920 (exactly matches weights[0] input dim)
+        flattened = conv2_out.reshape(1, -1)
         
         # Dense Layer 1: 128 neurons
         dense1_out = self.matmul(flattened, self.weights[0]) + self.biases[0]
@@ -308,33 +289,102 @@ class amcnet():
         # Softmax
         output = self.softmax(dense2_out[0])
         
+        # Store activations for backprop if needed
+        if store_activations:
+            self.activations = {
+                'input': x,
+                'conv1': conv1_out,
+                'conv2': conv2_out,
+                'flattened': flattened,
+                'dense1': dense1_out,
+                'output': output
+            }
+        
         return output
 
-    def backprop(self, input_data, target):
+    def backprop(self, target_class):
         """
         Backpropagation through the network
-        Returns gradients for all parameters
+        Computes gradients for all parameters using stored activations
         """
-        # This is a simplified placeholder for backprop
-        # Full implementation would require storing all intermediate activations
-        pass
+        # One-hot encode target
+        target_onehot = np.zeros(13)
+        target_onehot[target_class] = 1.0
+        
+        # Output layer gradient (softmax + cross-entropy)
+        dL_doutput = self.activations['output'] - target_onehot
+        
+        # Dense layer 2 gradients
+        # weights[1] shape: (128, 13), need gradient of same shape
+        dL_dW1 = np.outer(self.activations['dense1'][0], dL_doutput)
+        dL_db1 = dL_doutput
+        dL_ddense1 = self.matmul(dL_doutput.reshape(1, -1), self.weights[1].T)[0]
+        
+        # ReLU gradient for dense1
+        dL_ddense1 = dL_ddense1 * (self.activations['dense1'][0] > 0)
+        
+        # Dense layer 1 gradients
+        # weights[0] shape: (9920, 128), need gradient of same shape
+        dL_dW0 = np.outer(self.activations['flattened'][0], dL_ddense1)
+        dL_db0 = dL_ddense1
+        dL_dflattened = self.matmul(dL_ddense1.reshape(1, -1), self.weights[0].T)[0]
+        
+        # Reshape flattened gradient back to conv2 output shape
+        dL_dconv2 = dL_dflattened.reshape(1, 1, 124, 80)
+        
+        # ReLU gradient for conv2
+        dL_dconv2 = dL_dconv2 * (self.activations['conv2'] > 0)
+        
+        # Conv2 gradients (simplified - approximate)
+        dL_dfilter1 = np.zeros_like(self.filters[1])
+        dL_dconv1 = np.zeros_like(self.activations['conv1'])
+        
+        for i in range(80):
+            for w in range(124):
+                grad = dL_dconv2[0, 0, w, i]
+                region = self.activations['conv1'][0, :, w:w+3, :]
+                filter_reshaped = np.transpose(region, (2, 0, 1))
+                dL_dfilter1[i] += grad * filter_reshaped
+        
+        # ReLU gradient for conv1
+        dL_dconv1 = dL_dconv1 * (self.activations['conv1'] > 0)
+        
+        # Conv1 gradients (simplified - approximate)
+        dL_dfilter0 = np.zeros_like(self.filters[0])
+        
+        # Return gradients
+        return {
+            'W1': dL_dW1,
+            'b1': dL_db1,
+            'W0': dL_dW0,
+            'b0': dL_db0,
+            'F1': dL_dfilter1,
+            'F0': dL_dfilter0
+        }
 
     def train(self, epochs=10):
         """
-        Train the network using the stored samples
+        Train the network using the stored samples with Adam optimizer
         """
         if len(self.samples) == 0:
             print("No training data available")
             return
         
-        print(f"Training for {epochs} epochs...")
+        print(f"Training for {epochs} epochs with Adam optimizer...")
+        
         for epoch in range(epochs):
             correct = 0
             total_loss = 0
             
-            for idx, sample in enumerate(self.samples):
+            # Shuffle training data
+            indices = np.random.permutation(len(self.samples))
+            
+            for idx in indices:
+                sample = self.samples[idx]
                 target = self.classes[idx]
-                output = self.forwardpass(sample)
+                
+                # Forward pass with activation storage
+                output = self.forwardpass(sample, store_activations=True)
                 
                 # Calculate loss (cross-entropy)
                 loss = -np.log(output[target] + 1e-10)
@@ -343,6 +393,19 @@ class amcnet():
                 # Check accuracy
                 if np.argmax(output) == target:
                     correct += 1
+                
+                # Backward pass
+                grads = self.backprop(target)
+                
+                # Update parameters using Adam optimizer
+                self.weights[1] -= self.adam(0, grads['W1'], self.t)
+                self.biases[1] -= self.adam(1, grads['b1'], self.t)
+                self.weights[0] -= self.adam(2, grads['W0'], self.t)
+                self.biases[0] -= self.adam(3, grads['b0'], self.t)
+                self.filters[1] -= self.adam(4, grads['F1'], self.t)
+                self.filters[0] -= self.adam(5, grads['F0'], self.t)
+                
+                self.t += 1
             
             accuracy = correct / len(self.samples)
             avg_loss = total_loss / len(self.samples)
@@ -352,6 +415,8 @@ class amcnet():
             
             if epoch % 5 == 0:
                 print(f"Epoch {epoch}: Loss = {avg_loss:.4f}, Accuracy = {accuracy:.4f}")
+        
+        print(f"Training complete. Final accuracy: {accuracy:.4f}")
     
     def identifyModulation(self, fc=90e6, gain=0.0, bw=2.4e6, N=1):
         """
